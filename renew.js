@@ -47,9 +47,8 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 深度清理反馈评分、营销升级、Discord 加入等弹窗
+// 🛡️ 精准清理反馈、评分、营销升级、Discord 等干扰弹窗
 async function forceDismissPopups(page) {
-  // 1. 关闭 Cookie 栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
     if (await cookieBtn.isVisible({ timeout: 500 })) {
@@ -57,22 +56,31 @@ async function forceDismissPopups(page) {
     }
   } catch (e) {}
 
-  // 2. 点击可见的 Maybe later
-  for (let i = 0; i < 3; i++) {
-    try {
+  try {
+    const isInterferingModalVisible = await page.evaluate(() => {
+      const txt = document.body.innerText || '';
+      return (
+        txt.includes('How would you rate FreeMCHost') ||
+        txt.includes('Your feedback') ||
+        txt.includes('Got an idea to make FreeMCHost better') ||
+        txt.includes('Get Free+ (2GB)') ||
+        txt.includes('Upgrade to Free+') ||
+        txt.includes('Join the FreeMCHost community')
+      );
+    });
+
+    if (isInterferingModalVisible) {
       const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
-      if (await maybeLater.isVisible({ timeout: 800 })) {
+      if (await maybeLater.isVisible({ timeout: 600 })) {
         await maybeLater.click({ force: true });
-        console.log('🛡️ 已点击 [Maybe later] 关闭弹窗');
+        console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
         await page.waitForTimeout(400);
       }
-    } catch (e) {}
-  }
+    }
+  } catch (e) {}
 
-  // 3. 原生 DOM 精准移除干扰模态框（打分、反馈、免费升级、Discord等）
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
-    
     const noiseHeaders = allEls.filter(el => {
       const txt = el.textContent || '';
       return (
@@ -89,25 +97,24 @@ async function forceDismissPopups(page) {
       let container = header;
       for (let i = 0; i < 7; i++) {
         if (container.parentElement && container.parentElement !== document.body) {
-          if (container.parentElement.innerText && container.parentElement.innerText.includes('Keep your server online')) {
-            break;
+          if (container.innerText && container.innerText.includes('Keep your server online')) {
+            return;
           }
           container = container.parentElement;
         }
       }
-      if (container && container !== document.body) {
+      if (container && container !== document.body && !container.innerText.includes('Keep your server online')) {
         container.remove();
       }
     });
 
-    // 清理遗留的全屏遮罩
     const backdrops = allEls.filter(el => 
       el.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
     );
     backdrops.forEach(b => b.remove());
   });
 
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(200);
 }
 
 // 模拟真实用户输入
@@ -126,31 +133,67 @@ async function safeFill(page, locator, value, label) {
   }
 }
 
-// 统一提取页面倒计时工具
+// 切换至 PLAN Billing 标签页
+async function switchToBillingTab(page) {
+  const tabCandidates = page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i });
+  const count = await tabCandidates.count();
+  for (let idx = 0; idx < count; idx++) {
+    const item = tabCandidates.nth(idx);
+    if (await item.isVisible().catch(() => false)) {
+      const txt = await item.innerText().catch(() => '');
+      if (!txt.includes('Total') && (txt.includes('Billing') || txt.includes('PLAN'))) {
+        await item.click({ force: true });
+        console.log(`👉 已点击标签: [${txt.replace(/\n/g, ' ')}]`);
+        break;
+      }
+    }
+  }
+  await page.waitForTimeout(2000);
+  await forceDismissPopups(page);
+}
+
+// 高强韧倒计时提取
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
     const header = allEls.find(el => el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
-    if (!header) return null;
 
-    let container = header.parentElement;
-    for (let k = 0; k < 3; k++) {
-      if (container && container.innerText.includes('Renew now')) break;
-      if (container && container.parentElement) container = container.parentElement;
+    if (header) {
+      let container = header.parentElement;
+      for (let k = 0; k < 4; k++) {
+        if (container) {
+          const txt = container.innerText || '';
+          const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
+          if (m) {
+            const d = parseInt(m[1], 10);
+            const h = parseInt(m[2], 10);
+            const min = parseInt(m[3], 10);
+            return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+          }
+          container = container.parentElement;
+        }
+      }
     }
 
-    if (!container) return null;
-
-    const text = container.innerText;
-    const match = text.match(/(\d{1,2})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
-    if (match) {
-      const d = parseInt(match[1], 10);
-      const h = parseInt(match[2], 10);
-      const m = parseInt(match[3], 10);
-      return { totalHours: d * 24 + h + m / 60, raw: `${d}天${h}小时${m}分` };
+    const bodyText = document.body.innerText || '';
+    const fallbackMatch = bodyText.match(/(\d{1,3})\s*\n?\s*D\s*\n?\s*(\d{1,2})\s*\n?\s*H\s*\n?\s*(\d{1,2})\s*\n?\s*M/i);
+    if (fallbackMatch) {
+      const d = parseInt(fallbackMatch[1], 10);
+      const h = parseInt(fallbackMatch[2], 10);
+      const min = parseInt(fallbackMatch[3], 10);
+      return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
     }
+
     return null;
   });
+}
+
+async function safeScreenshot(page, filePath) {
+  try {
+    await page.screenshot({ path: filePath, fullPage: false, timeout: 5000 });
+  } catch (e) {
+    console.log(`⚠️ 截图生成跳过: ${e.message}`);
+  }
 }
 
 (async () => {
@@ -229,31 +272,14 @@ async function extractExpiryTime(page) {
         await page.waitForTimeout(3000);
         await forceDismissPopups(page);
 
-        // 定位并点击 [PLAN Billing] 标签页
         console.log('🗂️ 正在定位并点击 [PLAN Billing] 标签页...');
-        const tabCandidates = page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i });
-        const count = await tabCandidates.count();
-        for (let idx = 0; idx < count; idx++) {
-          const item = tabCandidates.nth(idx);
-          if (await item.isVisible().catch(() => false)) {
-            const txt = await item.innerText().catch(() => '');
-            if (!txt.includes('Total') && (txt.includes('Billing') || txt.includes('PLAN'))) {
-              await item.click({ force: true });
-              console.log(`👉 已点击标签: [${txt.replace(/\n/g, ' ')}]`);
-              break;
-            }
-          }
-        }
-
-        await page.waitForTimeout(2500);
-        await forceDismissPopups(page);
+        await switchToBillingTab(page);
 
         const renewBtn = page.locator('button:has-text("Renew now")').first();
         await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
         await page.waitForTimeout(1000);
         await forceDismissPopups(page);
 
-        // 提取剩余时间
         const timeData = await extractExpiryTime(page);
         const remainHours = timeData ? timeData.totalHours : 99;
         const remainStr = timeData ? timeData.raw : '未读取到';
@@ -263,16 +289,37 @@ async function extractExpiryTime(page) {
           console.log(`🎯 剩余时长 < 46 小时，打开续期弹窗...`);
           await renewBtn.click();
           await page.waitForTimeout(1500);
-
-          // 清理叠加的评分等干扰弹窗
           await forceDismissPopups(page);
-          await page.waitForTimeout(1000);
 
-          console.log('👉 正在定位并点击 [60 hours] 卡片...');
-          let cardClicked = false;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            await forceDismissPopups(page);
-            cardClicked = await page.evaluate(() => {
+          console.log('⏳ 正在等待 [60 hours] 选项从置灰变为可点击状态 (需等待 3-5 秒校验)...');
+          const renewModal = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
+          await renewModal.waitFor({ state: 'visible', timeout: 10000 });
+
+          let isReady = false;
+          for (let poll = 0; poll < 10; poll++) {
+            isReady = await page.evaluate(() => {
+              const text = document.body.innerText || '';
+              return !text.toLowerCase().includes('come back later');
+            });
+
+            if (isReady && poll >= 3) {
+              console.log(`✅ [60 hours] 选项状态已解锁！(耗时约 ${poll * 1.2} 秒)`);
+              break;
+            }
+            await page.waitForTimeout(1200);
+          }
+
+          console.log('👉 正在点击 [60 hours] 选项卡...');
+          let clicked = false;
+          const cardLocator = renewModal.locator('div, button').filter({ hasText: /60\s*hours/i }).last();
+          if (await cardLocator.isVisible({ timeout: 3000 }).catch(() => false)) {
+            await cardLocator.click({ force: true });
+            clicked = true;
+            console.log('🎉 已通过定位器成功点击 [60 hours] 卡片！');
+          }
+
+          if (!clicked) {
+            clicked = await page.evaluate(() => {
               const allEls = Array.from(document.querySelectorAll('*'));
               const target = allEls.find(el => 
                 el.children.length === 0 && 
@@ -284,7 +331,7 @@ async function extractExpiryTime(page) {
               for (let j = 0; j < 6; j++) {
                 if (p.parentElement && p.parentElement !== document.body) {
                   p = p.parentElement;
-                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || p.classList.toString().includes('cursor-pointer') || p.classList.toString().includes('rounded')) {
+                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || (p.className || '').includes('rounded')) {
                     p.click();
                     return true;
                   }
@@ -293,27 +340,45 @@ async function extractExpiryTime(page) {
               target.click();
               return true;
             });
+            if (clicked) console.log('🎉 已通过 DOM 原生派发触发 [60 hours] 点击！');
+          }
 
-            if (cardClicked) {
-              console.log('🎉 已成功触发 [60 hours] 选项卡点击！');
+          console.log('⏳ 指令已下发，等待服务端入账 (4 秒)...');
+          await page.waitForTimeout(4000);
+
+          // 核心重置流程：关弹窗 -> 刷新页面 -> 重新切回 PLAN Billing 提取最新准确倒计时
+          console.log('🔄 正在退出续期弹窗并刷新页面...');
+          await page.keyboard.press('Escape');
+          await page.waitForTimeout(500);
+          await forceDismissPopups(page);
+
+          console.log('🔃 重新加载当前服务器面板...');
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.waitForTimeout(2500);
+          await forceDismissPopups(page);
+
+          console.log('🗂️ 重新进入 [PLAN Billing] 标签页读取最新数据...');
+          await switchToBillingTab(page);
+
+          const reloadRenewBtn = page.locator('button:has-text("Renew now")').first();
+          await reloadRenewBtn.waitFor({ state: 'visible', timeout: 15000 });
+          await page.waitForTimeout(1000);
+
+          let newRemainStr = '已满血加时';
+          for (let check = 0; check < 5; check++) {
+            const newTimeData = await extractExpiryTime(page);
+            if (newTimeData && newTimeData.totalHours > remainHours) {
+              newRemainStr = newTimeData.raw;
+              console.log(`⏱️ 刷新验证通过！获取到最新倒计时: ${newRemainStr} (总计约 ${newTimeData.totalHours.toFixed(1)} 小时)`);
               break;
+            } else if (newTimeData) {
+              newRemainStr = newTimeData.raw;
             }
             await page.waitForTimeout(1000);
           }
 
-          // 点完即生效，等待 4 秒让倒计时完成重绘
-          console.log('⏳ 等待服务端完成续期并刷新数据...');
-          await page.waitForTimeout(4000);
-          // 清除随后可能弹出的 Discord 推广弹窗
-          await forceDismissPopups(page);
-
-          // 抓取续期后的新时长
-          const newTimeData = await extractExpiryTime(page);
-          const newRemainStr = newTimeData ? newTimeData.raw : '已满血加时';
-          console.log(`⏱️ 续期后页面剩余时长: ${newRemainStr}`);
-
           reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${newRemainStr}</b>`);
-          await page.screenshot({ path: `screenshots/renew-success-server-${sIndex}.png`, fullPage: true });
+          await safeScreenshot(page, `screenshots/renew-success-server-${sIndex}.png`);
 
         } else {
           console.log(`⏳ 服务器 [${sIndex}] 距离 46h 开放还差约 ${(remainHours - 46).toFixed(1)} 小时，保持等待。`);
@@ -323,9 +388,7 @@ async function extractExpiryTime(page) {
       } catch (innerErr) {
         console.error(`❌ 服务器 [${sIndex}] 处理异常:`, innerErr.message);
         reports.push(`🔴 <b>服务器 ${sIndex}</b>: 巡检失败 (${innerErr.message.substring(0, 30)})`);
-        try {
-          await page.screenshot({ path: `screenshots/error-server-${sIndex}.png`, fullPage: true });
-        } catch (e) {}
+        await safeScreenshot(page, `screenshots/error-server-${sIndex}.png`);
       }
     }
 
@@ -335,9 +398,7 @@ async function extractExpiryTime(page) {
 
   } catch (error) {
     console.error('❌ 全局致命错误:', error.message);
-    try {
-      await page.screenshot({ path: 'screenshots/renew_fatal.png', fullPage: true });
-    } catch (e) {}
+    await safeScreenshot(page, 'screenshots/renew_fatal.png');
     await sendTelegramMessage(tgToken, tgChatId, `🚨 <b>Freemchost 运行崩溃:</b> <code>${error.message}</code>`);
     process.exitCode = 1;
   } finally {
