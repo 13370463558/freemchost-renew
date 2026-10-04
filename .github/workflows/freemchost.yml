@@ -1,9 +1,9 @@
 name: Freemchost Auto Renew Permanent
 
 on:
-  # schedule:
+  schedule:
     # 每天执行 2 次（UTC 00:15 和 12:15，即北京时间 08:15 和 20:15）
-    # - cron: '15 0,12 * * *'
+    - cron: '15 0,12 * * *'
   workflow_dispatch:
 
 permissions:
