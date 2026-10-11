@@ -2,8 +2,8 @@ name: Freemchost Auto Renew & Keepalive
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '1 0 * * *'
+  # schedule:
+    # - cron: '1 0 * * *'
 
 # 保持单例运行，防止并发堆叠
 concurrency:
