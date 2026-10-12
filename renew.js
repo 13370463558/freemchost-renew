@@ -56,11 +56,19 @@ async function cleanPopup(page) {
       'button:has-text("Maybe later")',
       'div[role="dialog"] button:has-text("Maybe later")',
       'text="Maybe later"',
+      'button:has-text("Reject all")',
+      'button:has-text("Customize")',
       'button:has-text("Accept")',
       'button:has-text("I understand")',
       'button:has-text("Dismiss")',
       'button:has-text("Close")',
-      '[aria-label="Close"]'
+      'button:has-text("Not now")',
+      'button:has-text("No thanks")',
+      'button:has-text("Skip")',
+      'button:has-text("Got it")',
+      '[aria-label="Close"]',
+      '[data-radix-popper-content-wrapper] button[aria-label="Close"]',
+      'div[role="dialog"] button:has-text("Close")',
     ];
     for (const sel of popups) {
       const el = page.locator(sel).first();
