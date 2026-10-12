@@ -2,6 +2,14 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
+// —— 可配置常量 ——
+// 服务器列表页地址（仅用于续期成功后回读剩余时间与截图）
+const LIST_PAGE_URL = 'https://freemchost.com/app/servers';
+// 列表页卡片底部"剩余时间"标签。依赖英文界面，站点若改文案只需改这一处。
+const LIST_PAGE_LABEL_EXPIRES = 'EXPIRES IN';
+// 续期弹窗中的时长选项（现有物理点击方案的目标）
+const RENEW_OPTION_TEXT = '60 hours';
+
 // Telegram 消息与截图推送
 async function sendTG(botToken, chatId, text, photoPath) {
   if (!botToken || !chatId) return;
@@ -312,235 +320,404 @@ async function triggerStartServer(page) {
   await cleanPopup(page);
 }
 
-// 提取当前实时的倒计时数据
-async function extractExpiryTime(page, maxTries = 5) {
-  for (let retry = 0; retry < maxTries; retry++) {
-    const result = await page.evaluate(() => {
-      const allEls = Array.from(document.querySelectorAll('*'));
-      const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase().includes('TIME UNTIL EXPIRY'));
-      if (header) {
-        let container = header.parentElement;
-        for (let k = 0; k < 4; k++) {
-          if (container) {
-            const txt = container.innerText || '';
-            const m = txt.match(/(\d{1,3})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
-            if (m) {
-              const d = parseInt(m[1], 10);
-              const h = parseInt(m[2], 10);
-              const min = parseInt(m[3], 10);
-              return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
-            }
-            container = container.parentElement;
-          }
-        }
-      }
+// —— 纯函数：解析列表页剩余时间文本 ——
+// 兼容站点实际格式：
+//   "17 : 41 : 13"        → 约 17.687h
+//   "1d 2 : 41 : 13"      → 约 26.687h（"1d" 与 "2 :" 之间有无空格都要吃）
+//   "0d 05 : 00 : 00"     → 5.0h
+//   "2d"                  → 48.0h
+//   "Expired" / 乱码 / 空 → null（log 原文，绝不静默当 0）
+function parseExpiryText(text) {
+  const raw = (text == null ? '' : String(text)).replace(/\s+/g, ' ').trim();
+  if (!raw) {
+    console.log('⚠️ parseExpiryText: 收到空文本，无法解析剩余时间');
+    return null;
+  }
+  if (/expired/i.test(raw)) {
+    console.log(`⚠️ parseExpiryText: 站点显示已过期，原始文本="${raw}"`);
+    return null;
+  }
 
-      const bodyText = document.body ? (document.body.innerText || '') : '';
-      const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
-      if (m) {
-        const d = parseInt(m[1], 10);
-        const h = parseInt(m[2], 10);
-        const min = parseInt(m[3], 10);
-        return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
+  // 天部分：形如 "1d" / "2d"，d 后不能紧跟字母（避免误吃普通单词）
+  const dayMatch = raw.match(/(\d+)\s*d(?![a-z])/i);
+  const days = dayMatch ? parseInt(dayMatch[1], 10) : 0;
+
+  // 时间部分：HH : MM (: SS)，冒号两侧允许空格
+  const timeMatch = raw.match(/(\d{1,3})\s*:\s*(\d{1,2})\s*(?::\s*(\d{1,2}))?/);
+  let hours = 0;
+  let minutes = 0;
+  let seconds = 0;
+  if (timeMatch) {
+    hours = parseInt(timeMatch[1], 10);
+    minutes = parseInt(timeMatch[2], 10);
+    seconds = timeMatch[3] ? parseInt(timeMatch[3], 10) : 0;
+  }
+
+  if (!dayMatch && !timeMatch) {
+    console.log(`⚠️ parseExpiryText: 无法识别的剩余时间文本，原始值="${raw}"`);
+    return null;
+  }
+
+  return { totalHours: days * 24 + hours + minutes / 60 + seconds / 3600, raw };
+}
+
+// —— 浏览器上下文函数：定位列表页每张服务器卡片及其 EXPIRES IN 数值 ——
+// 只会被 page.evaluate 序列化后丢进浏览器执行，禁止引用任何 Node 侧变量。
+//
+// "从 EXPIRES IN 向上定位所属服务器卡片"的判定依据（对应截图特征）：
+//   a. 该祖先文本含状态徽章 "Active" / "Expiring" —— 截图每张卡片顶部的状态徽章
+//   b. 或含规格标签 "RAM" / "CPU" / "DISK"        —— 截图卡片中部的三格
+//   c. 或尺寸明显大于一行（height>120 且 width>200）—— 越过单行文本后落到整张卡片
+// 逐层向上，命中任一特征即停；不写死 3~4 层 parentElement。
+// 同时给卡片打上唯一属性 attr，供 Node 侧用 Playwright locator 精确截图。
+function browserFindExpiryCards({ label, attr }) {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const labelUpper = label.toUpperCase();
+  const all = Array.from(document.querySelectorAll('*'));
+
+  // 优先最内层精确匹配"EXPIRES IN"的元素；找不到再放宽为包含匹配
+  let labels = all.filter((el) => el.children.length === 0 && norm(el.textContent).toUpperCase() === labelUpper);
+  if (!labels.length) {
+    labels = all.filter((el) => el.children.length === 0 && norm(el.textContent).toUpperCase().includes(labelUpper));
+  }
+
+  const seen = new Set();
+  const cards = [];
+  for (const labelEl of labels) {
+    let node = labelEl;
+    let card = null;
+    for (let up = 0; up < 10 && node; up++) {
+      const t = norm(node.innerText);
+      const hasBadge = /\b(active|expiring)\b/i.test(t);
+      const hasSpecs = /\b(RAM|CPU|DISK)\b/.test(t);
+      const r = node.getBoundingClientRect();
+      const largeEnough = r.height > 120 && r.width > 200;
+      if (t.toUpperCase().includes(labelUpper) && (hasBadge || hasSpecs || largeEnough)) {
+        card = node;
+        break;
       }
-      return null;
+      node = node.parentElement;
+    }
+    if (!card || seen.has(card)) continue;
+    seen.add(card);
+
+    // 取 "EXPIRES IN" 所在的那一行，去掉标签后剩下的就是倒计时数值
+    let row = labelEl;
+    for (let up = 0; up < 4 && row; up++) {
+      const rt = norm(row.innerText).toUpperCase();
+      if (rt.includes(labelUpper) && rt.replace(labelUpper, '').trim().length > 0) break;
+      row = row.parentElement;
+    }
+    const rowText = norm(row ? row.innerText : '');
+
+    const idx = cards.length;
+    card.setAttribute(attr, String(idx));
+    cards.push({
+      text: norm(card.innerText),
+      expiresText: rowText.replace(new RegExp(labelUpper, 'i'), '').trim()
     });
+  }
+  return cards;
+}
 
-    if (result) return result;
-    await page.waitForTimeout(1000);
+const EXPIRY_CARD_ATTR = 'data-fx-expiry-card';
+
+// 收集列表页所有服务器卡片（含 EXPIRES IN 数值文本 + Node 侧索引）
+async function gatherExpiryCards(page) {
+  try {
+    const cards = await page.evaluate(browserFindExpiryCards, { label: LIST_PAGE_LABEL_EXPIRES, attr: EXPIRY_CARD_ATTR });
+    return (cards || []).map((c, i) => ({ ...c, idx: i }));
+  } catch (e) {
+    console.log(`⚠️ 读取列表页卡片结构异常（不影响主任务）: ${e.message}`);
+    return [];
+  }
+}
+
+// 从多张卡片中按服务器名挑一张（名字对不上就兜底）
+function pickExpiryCard(cards, serverName) {
+  if (!cards.length) return null;
+  if (serverName) {
+    const hit = cards.find((c) => c.text.includes(serverName));
+    if (hit) return hit;
+    console.log(`⚠️ 列表页未找到名称含 "${serverName}" 的卡片（共 ${cards.length} 张）`);
+  }
+  if (cards.length === 1) return cards[0];
+  console.log(`⚠️ 列表页存在 ${cards.length} 张服务器卡片且无法按名匹配，兜底取第 1 张（存在取错风险）`);
+  return cards[0];
+}
+
+// 导航到列表页并读取指定服务器的剩余时间；任何失败都返回 null，不抛异常
+async function fetchExpiryFromListPage(page, serverName) {
+  try {
+    console.log('📃 前往服务器列表页读取剩余时间...');
+    await page.goto(LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await cleanPopup(page);
+
+    const cards = await gatherExpiryCards(page);
+    if (!cards.length) {
+      console.log(`⚠️ 列表页未定位到任何含 "${LIST_PAGE_LABEL_EXPIRES}" 的服务器卡片，返回 null`);
+      return null;
+    }
+    const card = pickExpiryCard(cards, serverName);
+    if (!card) return null;
+
+    let parsed = parseExpiryText(card.expiresText);
+    if (!parsed) {
+      // 兜底：从整卡文本里截取 EXPIRES IN 之后的片段再解析
+      const at = card.text.toUpperCase().indexOf(LIST_PAGE_LABEL_EXPIRES);
+      const tail = at >= 0 ? card.text.slice(at + LIST_PAGE_LABEL_EXPIRES.length).trim() : '';
+      parsed = parseExpiryText(tail);
+    }
+    if (!parsed) {
+      console.log(`⚠️ 列表页卡片 EXPIRES IN 数值解析失败，原始行文本="${card.expiresText}"`);
+      return null;
+    }
+    console.log(`⏱️ 列表页读取到剩余时间: ${parsed.raw} (约 ${parsed.totalHours.toFixed(2)}h)`);
+    return parsed;
+  } catch (e) {
+    console.log(`⚠️ 读取列表页剩余时间异常（不影响主任务）: ${e.message}`);
+    return null;
+  }
+}
+
+// 从详情页读取服务器名（best-effort，用于列表页按名匹配卡片；读不到返回 null）
+async function readServerNameFromDetail(page) {
+  try {
+    const name = await page.evaluate(() => {
+      const m = (document.body ? document.body.innerText : '').match(/\bFree-[A-Za-z0-9]{2,}\b/);
+      return m ? m[0] : '';
+    });
+    if (name) console.log(`🏷️ 详情页读取到服务器名: ${name}`);
+    return name || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 截取列表页包含 EXPIRES IN 的那张服务器卡片（续期成功后作为推送图片）
+// 截不到卡片 → 退回全页截图；仍然失败 → 返回 null（调用方只发文字）
+async function captureExpiryCard(page, serverName) {
+  fs.mkdirSync('screenshots', { recursive: true });
+  const savedScreenshot = path.join('screenshots', `expiry-${Date.now()}.png`);
+
+  try {
+    // 若当前还在详情页，先切到列表页
+    if (page.url().includes('/app/servers/')) {
+      await page.goto(LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      await cleanPopup(page);
+    }
+    const cards = await gatherExpiryCards(page);
+    const card = pickExpiryCard(cards, serverName);
+    if (card) {
+      const loc = page.locator(`[${EXPIRY_CARD_ATTR}="${card.idx}"]`).first();
+      if (await loc.count().catch(() => 0)) {
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.screenshot({ path: savedScreenshot });
+        console.log(`📸 已截取列表页续期卡片: ${savedScreenshot}`);
+        return savedScreenshot;
+      }
+    }
+    console.log('⚠️ 未定位到续期卡片，退回全页截图');
+  } catch (e) {
+    console.log(`⚠️ 续期卡片截图异常，退回全页截图: ${e.message}`);
+  }
+
+  try {
+    await page.screenshot({ path: savedScreenshot, fullPage: false });
+    return savedScreenshot;
+  } catch (e) {
+    console.log(`⚠️ 全页截图也失败，本次仅发文字: ${e.message}`);
+    return null;
+  }
+}
+
+// 查找详情页是否出现续期按钮（站点自身阈值判定：出现=需要续期）
+async function findRenewButton(page) {
+  const selectors = [
+    'button:has-text("Renew now")',
+    '[role="button"]:has-text("Renew now")',
+    'a:has-text("Renew now")'
+  ];
+  for (const sel of selectors) {
+    const el = page.locator(sel).first();
+    if (await el.isVisible({ timeout: 2500 }).catch(() => false)) return { el, sel };
   }
   return null;
 }
 
-// 精准截取倒计时小卡片
-async function captureExpiryCard(page) {
-  fs.mkdirSync('screenshots', { recursive: true });
-  const savedScreenshot = path.join('screenshots', `billing-${Date.now()}.png`);
-
+// 安全截图（失败返回 null）
+async function safeScreenshot(page, tag) {
   try {
-    const cardBox = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('*'));
-      const target = els.find(el => (el.textContent || '').trim().toUpperCase().includes('TIME UNTIL EXPIRY') && el.children.length === 0);
-      if (!target) return null;
-
-      let p = target.parentElement;
-      for (let i = 0; i < 4 && p; i++) {
-        const txt = p.innerText || '';
-        if (txt.includes('TIME UNTIL EXPIRY') && (txt.includes('Renews on demand') || txt.includes('D'))) {
-          const r = p.getBoundingClientRect();
-          if (r.width > 100 && r.height > 40) {
-            return { x: r.x, y: r.y, width: Math.min(r.width, 275), height: r.height };
-          }
-        }
-        p = p.parentElement;
-      }
-      const rect = target.getBoundingClientRect();
-      return { x: rect.x - 5, y: rect.y - 5, width: 260, height: 110 };
-    });
-
-    if (cardBox && cardBox.width > 0 && cardBox.height > 0) {
-      await page.screenshot({
-        path: savedScreenshot,
-        clip: {
-          x: Math.max(0, cardBox.x),
-          y: Math.max(0, cardBox.y),
-          width: cardBox.width + 12,
-          height: cardBox.height + 8
-        }
-      });
-      console.log(`📸 已成功截取精准倒计时小卡片: ${savedScreenshot}`);
-      return savedScreenshot;
-    }
+    fs.mkdirSync('screenshots', { recursive: true });
+    const p = path.join('screenshots', `${tag}-${Date.now()}.png`);
+    await page.screenshot({ path: p, fullPage: false });
+    return p;
   } catch (e) {
-    console.log('⚠️ 精确小图截取异常，使用全页备选截屏:', e.message);
+    return null;
   }
-
-  await page.screenshot({ path: savedScreenshot, fullPage: false });
-  return savedScreenshot;
 }
 
-// 核心租期核对、多模态续期击发及数据回验
-async function handleBillingRenew(page) {
-  let savedScreenshot = null;
+// 核心：以"续期按钮是否出现"作为站点阈值判定 —— 出现才续期
+// 返回结构化结果 { renewNeeded, success, message, error }，由主流程决定是否推送：
+//   error=true                          → 流程异常，必须推送错误
+//   renewNeeded=false                   → 按钮未出现（租期充足），静默跳过、不推送
+//   renewNeeded=true, success=true      → 续期成功（列表页剩余时间明显高于续期前基线）
+//   renewNeeded=true, success=false/null→ 失败 / 已发指令但未确认，需推送
+async function handleBillingRenew(page, listPage, serverName) {
+  const result = { renewNeeded: false, success: null, message: '无需续期（续期按钮未出现）', error: false };
   try {
-    console.log('👉 切换至 PLAN Billing 页面核对租期...');
+    console.log('👉 打开 PLAN/Billing 标签，检查是否出现续期按钮（以站点自身阈值为准）...');
     const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
-    if (await billingTab.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await billingTab.click({ force: true });
-      await page.waitForTimeout(2500);
+    if (await billingTab.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await billingTab.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(2000);
       await cleanPopup(page);
-
-      // 1. 获取当前实时剩余时间
-      let timeData = await extractExpiryTime(page);
-      let remainHours = timeData ? timeData.totalHours : 99;
-      let rawStr = timeData ? timeData.raw : '未获取到';
-      console.log(`⏱️ 当前租期剩余时长: ${rawStr} (约 ${remainHours.toFixed(1)}h)`);
-
-      let renewStatus = '';
-
-      if (remainHours < 46) {
-        console.log(`🎯 租期低于 46 小时 (${remainHours.toFixed(1)}h)，打开续期弹窗...`);
-        const renewNowBtn = page.locator('button:has-text("Renew now")').first();
-        await renewNowBtn.click({ force: true });
-        await page.waitForTimeout(1500);
-        await cleanPopup(page);
-
-        // 积累人机交互防刷时间 (8 秒)
-        console.log('⏳ 弹窗停留缓冲 8 秒 (累积真人交互与防刷签名)...');
-        for (let sec = 0; sec < 8; sec++) {
-          await cleanPopup(page);
-          await page.mouse.move(960 + sec * 5, 540 + sec * 3);
-          await page.waitForTimeout(1000);
-        }
-
-        // 确保弹窗仍在显示
-        const isModalVisible = await page.locator('text="Keep your server online"').isVisible().catch(() => false);
-        if (!isModalVisible) {
-          console.log('⚠️ 弹窗曾被异常关闭，重新拉起 Renew now...');
-          await renewNowBtn.click({ force: true });
-          await page.waitForTimeout(1500);
-        }
-
-        // 开启底层网络监听：确认真实的加时发包响应
-        let actionRpcTriggered = false;
-        const rpcCheck = async (res) => {
-          const u = res.url();
-          if (u.includes('_serverFn') && res.status() === 200) {
-            try {
-              const body = await res.text();
-              if (!body.includes('feedback') && !body.includes('bonuses')) {
-                actionRpcTriggered = true;
-                console.log(`📡 抓取到实际加时 RPC 响应: ${u.substring(0, 50)}...`);
-              }
-            } catch (e) {}
-          }
-        };
-        page.on('response', rpcCheck);
-
-        console.log('👉 启动多模态实体物理击发 [60 hours]...');
-        const targetOption = page.locator('div, button').filter({ hasText: /^60 hours/i }).last();
-        await targetOption.waitFor({ state: 'visible', timeout: 8000 });
-        await targetOption.scrollIntoViewIfNeeded().catch(() => {});
-
-        // 方案 1: 真实鼠标物理点按
-        const box = await targetOption.boundingBox();
-        if (box) {
-          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-          await page.waitForTimeout(150);
-          await page.mouse.down();
-          await page.waitForTimeout(150);
-          await page.mouse.up();
-        }
-
-        // 方案 2: 原生 click + 键盘 Enter / Space
-        await targetOption.click({ delay: 80 }).catch(() => {});
-        await page.keyboard.press('Enter');
-        await page.keyboard.press('Space');
-
-        // 方案 3: 触发父级表单直接提交
-        await page.evaluate(() => {
-          const cardEl = Array.from(document.querySelectorAll('*')).find(el => (el.textContent || '').includes('60 hours'));
-          if (cardEl) {
-            const form = cardEl.closest('form');
-            if (form) form.requestSubmit();
-            cardEl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          }
-        });
-
-        // 等待发包确认
-        for (let waitSec = 0; waitSec < 6; waitSec++) {
-          if (actionRpcTriggered) break;
-          await page.waitForTimeout(1000);
-        }
-        page.off('response', rpcCheck);
-
-        console.log('⏳ 等待后端入库事务处理 (10 秒)...');
-        await page.waitForTimeout(10000);
-        await cleanPopup(page);
-
-        // 修正：严禁清除 localStorage/sessionStorage（避免掉登录态）
-        // 原地重新加载页面获取最新落库数据
-        console.log('🔄 原地刷新页面获取加时后的最新落库数据...');
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(3000);
-        await cleanPopup(page);
-
-        // 切回 Billing 标签
-        const tabRecheck = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
-        await tabRecheck.scrollIntoViewIfNeeded().catch(() => {});
-        await tabRecheck.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(2000);
-        await cleanPopup(page);
-
-        const finalTimeData = await extractExpiryTime(page, 5);
-        const finalTime = finalTimeData ? finalTimeData.raw : '未获取到';
-        const finalHours = finalTimeData ? finalTimeData.totalHours : remainHours;
-
-        console.log(`⏱️ 终审核验结果: 前序 ${rawStr} ➔ 数据库实际存留: ${finalTime}`);
-
-        if (finalHours > remainHours + 20) {
-          console.log('🎉 终审通过：数据库已确实入账！');
-          renewStatus = `成功续期 (+60h)，最新剩余: ${finalTime}`;
-        } else {
-          // 如果时间因为 UI 渲染延迟未变，但 RPC 已经确认发包
-          if (actionRpcTriggered) {
-            renewStatus = `已发送续期指令 (+60h)，当前显示: ${finalTime}`;
-          } else {
-            renewStatus = `⚠️ 未检测到有效加时 (当前剩余: ${finalTime})`;
-          }
-        }
-      } else {
-        renewStatus = `剩余 ${rawStr} (租期充足无需加时)`;
-      }
-
-      // 无论是否续期，最后均对页面当前的最新倒计时卡片截取精准小图
-      savedScreenshot = await captureExpiryCard(page);
-      return { status: renewStatus, screenshot: savedScreenshot };
     }
+
+    const renewBtn = await findRenewButton(page);
+    if (!renewBtn) {
+      // 站点自己的阈值判定：按钮不出现 = 不需要续期。打印诊断便于人工确认选择器。
+      const diag = await page
+        .evaluate(() =>
+          Array.from(document.querySelectorAll('button,a,[role="button"]'))
+            .map((b) => (b.innerText || '').replace(/\s+/g, ' ').trim())
+            .filter((t) => /renew/i.test(t))
+            .slice(0, 8)
+        )
+        .catch(() => []);
+      console.log(`✅ 详情页未出现续期按钮 —— 站点判定租期充足，静默跳过（不推送）。含 "renew" 的元素: ${diag.length ? diag.join(' | ') : '无'}`);
+      return result;
+    }
+
+    result.renewNeeded = true;
+    console.log(`🎯 检测到续期按钮出现 (${renewBtn.sel}) —— 站点判定需要续期，开始执行...`);
+
+    // 续期前基线：去列表页读一次剩余时间，供续期后做严谨的"前后对比"
+    const baseline = await fetchExpiryFromListPage(listPage, serverName);
+    const baseHours = baseline ? baseline.totalHours : null;
+    console.log(
+      baseline
+        ? `📏 续期前基线剩余时间: ${baseline.raw} (约 ${baseHours.toFixed(2)}h)`
+        : '⚠️ 未能读取续期前基线剩余时间（续期后只能依赖 RPC 判断，无法数值对比）'
+    );
+
+    // 打开续期弹窗
+    await renewBtn.el.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await cleanPopup(page);
+
+    // 积累人机交互防刷时间 (8 秒)
+    console.log('⏳ 弹窗停留缓冲 8 秒 (累积真人交互与防刷签名)...');
+    for (let sec = 0; sec < 8; sec++) {
+      await cleanPopup(page);
+      await page.mouse.move(960 + sec * 5, 540 + sec * 3);
+      await page.waitForTimeout(1000);
+    }
+
+    // 确保弹窗仍在显示
+    const isModalVisible = await page.locator('text="Keep your server online"').isVisible().catch(() => false);
+    if (!isModalVisible) {
+      console.log('⚠️ 弹窗曾被异常关闭，重新拉起续期弹窗...');
+      await renewBtn.el.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+
+    // 开启底层网络监听：确认真实的加时发包响应
+    let actionRpcTriggered = false;
+    const rpcCheck = async (res) => {
+      const u = res.url();
+      if (u.includes('_serverFn') && res.status() === 200) {
+        try {
+          const body = await res.text();
+          if (!body.includes('feedback') && !body.includes('bonuses')) {
+            actionRpcTriggered = true;
+            console.log(`📡 抓取到实际加时 RPC 响应: ${u.substring(0, 50)}...`);
+          }
+        } catch (e) {}
+      }
+    };
+    page.on('response', rpcCheck);
+
+    console.log(`👉 启动多模态实体物理击发 [${RENEW_OPTION_TEXT}]...`);
+    const targetOption = page.locator('div, button').filter({ hasText: new RegExp(`^${RENEW_OPTION_TEXT}`, 'i') }).last();
+    await targetOption.waitFor({ state: 'visible', timeout: 8000 });
+    await targetOption.scrollIntoViewIfNeeded().catch(() => {});
+
+    // 方案 1: 真实鼠标物理点按
+    const box = await targetOption.boundingBox();
+    if (box) {
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.waitForTimeout(150);
+      await page.mouse.down();
+      await page.waitForTimeout(150);
+      await page.mouse.up();
+    }
+    // 方案 2: 原生 click + 键盘 Enter / Space
+    await targetOption.click({ delay: 80 }).catch(() => {});
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Space');
+    // 方案 3: 触发父级表单直接提交
+    await page.evaluate((opt) => {
+      const cardEl = Array.from(document.querySelectorAll('*')).find((el) => (el.textContent || '').includes(opt));
+      if (cardEl) {
+        const form = cardEl.closest('form');
+        if (form) form.requestSubmit();
+        cardEl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      }
+    }, RENEW_OPTION_TEXT);
+
+    // 等待发包确认
+    for (let waitSec = 0; waitSec < 6; waitSec++) {
+      if (actionRpcTriggered) break;
+      await page.waitForTimeout(1000);
+    }
+    page.off('response', rpcCheck);
+
+    console.log('⏳ 等待后端入库事务处理 (10 秒)...');
+    await page.waitForTimeout(10000);
+    await cleanPopup(page);
+
+    // 续期后：回列表页抓一次最新剩余时间（用于报告与最终校验）
+    const after = await fetchExpiryFromListPage(listPage, serverName);
+    const afterHours = after ? after.totalHours : null;
+
+    if (after) {
+      if (baseHours != null) {
+        if (afterHours > baseHours + 20) {
+          result.success = true;
+          result.message = `续期成功，列表页最新剩余时间: ${after.raw}（续期前基线 ${baseline.raw}）`;
+        } else {
+          result.success = false;
+          result.message = `已发送续期指令但未确认入账：续期前 ${baseline.raw} → 续期后 ${after.raw}`;
+        }
+      } else if (actionRpcTriggered) {
+        result.success = null;
+        result.message = `已发送续期指令，列表页最新剩余时间: ${after.raw}（无续期前基线，未能数值比对，未确认入账）`;
+      } else {
+        result.success = false;
+        result.message = `续期疑似未生效：列表页剩余时间 ${after.raw}，且未抓到加时 RPC`;
+      }
+    } else if (actionRpcTriggered) {
+      result.success = null;
+      result.message = '已发送续期指令，但未能读取续期后的剩余时间，无法确认是否入账';
+    } else {
+      result.success = false;
+      result.message = '续期失败：未能读取续期后的剩余时间，且未抓到加时 RPC';
+    }
+
+    console.log(`🧾 续期判定: success=${result.success} :: ${result.message}`);
+    return result;
   } catch (e) {
-    console.log(`⚠️ 租期核对异常: ${e.message}`);
+    console.log(`⚠️ 续期流程异常: ${e.message}`);
+    result.error = true;
+    result.success = false;
+    result.message = `续期流程异常: ${e.message}`;
+    return result;
   }
-  return { status: '核对未完成', screenshot: savedScreenshot };
 }
 
 // 主任务入口
@@ -552,7 +729,7 @@ async function runOnce() {
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
   const tgChatId = (process.env.TG_CHAT_ID || '').trim();
 
-  const serverUrls = rawUrls.split(/[\r\n,]+/).map(u => u.trim()).filter(u => u.startsWith('http'));
+  const serverUrls = rawUrls.split(/[\r\n,]+/).map((u) => u.trim()).filter((u) => u.startsWith('http'));
   if (!email || !password || serverUrls.length === 0) {
     console.error('❌ 缺失必要的账号或服务器地址配置');
     return;
@@ -569,8 +746,9 @@ async function runOnce() {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
   });
 
-  const page = await context.newPage();
-  let reports = [];
+  const page = await context.newPage();      // 详情页 / 主操作页
+  const listPage = await context.newPage();  // 专用于列表页读取与截图
+  const reports = [];
   let finalScreenshot = null;
 
   try {
@@ -581,34 +759,62 @@ async function runOnce() {
       const sIndex = i + 1;
       console.log(`\n================= 处理第 [${sIndex}/${serverUrls.length}] 台服务器 =================`);
 
+      // 1. 直接进详情页（不再去列表页做时间判定）
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 1. 开机维护 (主三角键 + Standard start)
+      // 读取服务器名（best-effort，用于列表页按名匹配卡片）
+      const serverName = await readServerNameFromDetail(page);
+
+      // 2. 开机维护（保留原职责，与是否需要续期无关）
       await triggerStartServer(page);
 
-      // 2. 检查租期、执行 60h 实体物理点击续期，并截取最新的倒计时卡片
-      const billRes = await handleBillingRenew(page);
-      if (billRes.screenshot) {
-        finalScreenshot = billRes.screenshot;
+      // 3. 续期：以站点是否出现续期按钮为准
+      const res = await handleBillingRenew(page, listPage, serverName);
+
+      if (res.error) {
+        // 流程异常 → 推送错误
+        console.error(`❌ 服务器 ${sIndex} 处理异常: ${res.message}`);
+        const shot = await safeScreenshot(page, 'renew-error');
+        if (!finalScreenshot && shot) finalScreenshot = shot;
+        reports.push(`❌ <b>服务器 ${sIndex} 处理异常</b>\n${res.message}`);
+        continue;
       }
 
-      reports.push(
-        `🖥️ <b>服务器 ${sIndex}</b>:\n` +
-        `   ⚡ <b>开机维护</b>: 已触发开机指令 (Standard Start)\n` +
-        `   📅 <b>长效租期</b>: ${billRes.status}`
-      );
+      if (!res.renewNeeded) {
+        // 续期按钮未出现 → 站点判定租期充足 → 静默，不推送任何消息
+        console.log(`🔕 服务器 ${sIndex}: 未出现续期按钮，租期充足，静默跳过（不推送）`);
+        continue;
+      }
+
+      if (res.success === true) {
+        // 续期成功 → 推送成功消息 + 列表页续期卡片截图
+        const shot = await captureExpiryCard(listPage, serverName);
+        if (shot) finalScreenshot = shot;
+        console.log(`✅ 服务器 ${sIndex}: ${res.message}`);
+        reports.push(`✅ <b>服务器 ${sIndex} 续期成功</b>\n${res.message}`);
+      } else {
+        // 失败 / 已发指令但未确认 → 推送告警
+        console.warn(`❌ 服务器 ${sIndex}: ${res.message}`);
+        const shot = await safeScreenshot(page, 'renew-fail');
+        if (!finalScreenshot && shot) finalScreenshot = shot;
+        reports.push(`❌ <b>服务器 ${sIndex} 续期未成功/未确认</b>\n${res.message}`);
+      }
     }
 
-    const nowStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    const summary =
-      `🤖 <b>FreeMCHost 巡检完成</b>\n\n` +
-      reports.join('\n\n') + '\n\n' +
-      `<b>策略:</b> 开机指令维持 + 46h门槛自动续期\n` +
-      `<b>完成时间:</b> ` + nowStr;
-
-    await sendTG(tgToken, tgChatId, summary, finalScreenshot);
+    // 4. 汇总推送：只有需要续期的服务器才进 reports
+    if (reports.length > 0) {
+      const nowStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+      const summary =
+        `🤖 <b>FreeMCHost 续期结果</b>\n\n` +
+        reports.join('\n\n') + '\n\n' +
+        `<b>策略:</b> 详情页出现续期按钮才续期（站点自身阈值），仅推送成功/失败\n` +
+        `<b>完成时间:</b> ` + nowStr;
+      await sendTG(tgToken, tgChatId, summary, finalScreenshot);
+    } else {
+      console.log('🔕 本次全部服务器均未出现续期按钮（租期充足），不推送任何消息。');
+    }
 
   } catch (err) {
     console.error('❌ 执行异常:', err.message);
@@ -624,6 +830,8 @@ async function runOnce() {
   }
 }
 
-(async () => {
-  await runOnce();
-})();
+if (require.main === module) {
+  runOnce();
+}
+
+module.exports = { parseExpiryText, fetchExpiryFromListPage, handleBillingRenew, gatherExpiryCards };
