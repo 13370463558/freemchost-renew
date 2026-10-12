@@ -68,41 +68,146 @@ async function cleanPopup(page) {
 // 登录模块
 async function doLogin(page, email, password) {
   console.log('🔑 正在登录 FreeMCHost...');
-  await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(1500);
-  await cleanPopup(page);
 
-  if (!page.url().includes('/login')) {
-    console.log('✅ 已处于登录状态');
-    return;
-  }
-
-  const emailInput = page.locator('input[type="email"]').first();
-  await emailInput.waitFor({ state: 'visible', timeout: 15000 });
-  await emailInput.fill(email);
-
-  const passInput = page.locator('input[type="password"]').first();
-  await passInput.click();
-  await passInput.fill(password);
-  await page.waitForTimeout(300);
-
-  const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
-  await signInBtn.click();
-
-  let loggedIn = false;
-  for (let wait = 0; wait < 20; wait++) {
-    await page.waitForTimeout(1000);
-    if (!page.url().includes('/login')) {
-      loggedIn = true;
-      break;
+  // —— 诊断收集：控制台错误 / 页面异常 / Supabase 鉴权响应 ——
+  // 这个站的登录走 Supabase Auth（signInWithPassword），失败时只弹 sonner toast 且自动消失，
+  // 原来的代码等 20 秒才截图，早已拍不到任何错误提示。这里把真正的失败原因抓下来打日志。
+  const diag = { console: [], pageErrors: [], auth: [] };
+  const onConsole = (m) => {
+    if (m.type() === 'error' || m.type() === 'warning') diag.console.push(`[${m.type()}] ${m.text()}`);
+  };
+  const onPageError = (e) => diag.pageErrors.push(String((e && e.message) || e));
+  const onRequestFailed = (r) =>
+    diag.pageErrors.push(`REQUEST_FAILED ${r.method()} ${r.url()} :: ${(r.failure() || {}).errorText || ''}`);
+  const onResponse = async (res) => {
+    const u = res.url();
+    if (/\/auth\/v1\//.test(u) || /supabase/i.test(u)) {
+      let body = '';
+      try { body = (await res.text()).slice(0, 400); } catch (e) {}
+      diag.auth.push(`${res.status()} ${res.request().method()} ${u} :: ${body.replace(/\s+/g, ' ')}`);
     }
-    await cleanPopup(page);
-  }
+  };
+  page.on('console', onConsole);
+  page.on('pageerror', onPageError);
+  page.on('requestfailed', onRequestFailed);
+  page.on('response', onResponse);
 
-  if (!loggedIn) {
-    throw new Error('登录未成功跳转，请检查账号密码');
+  const dumpDiag = (tag) => {
+    console.log(
+      `📋 诊断(${tag}): 鉴权响应 ${diag.auth.length} 条 / 页面异常 ${diag.pageErrors.length} 条 / 控制台 ${diag.console.length} 条`
+    );
+    diag.auth.slice(-4).forEach((l) => console.log(`   🔐 ${l}`));
+    diag.pageErrors.slice(-4).forEach((l) => console.log(`   ❗ ${l}`));
+    diag.console.slice(-6).forEach((l) => console.log(`   🖥️ ${l}`));
+  };
+
+  // 读取 sonner toast 的文案（失败提示就藏在这里，几秒后自动消失）
+  const readToast = () =>
+    page
+      .evaluate(() => {
+        const el = document.querySelector('[data-sonner-toast]');
+        if (!el) return '';
+        const t = el.querySelector('[data-title]');
+        const d = el.querySelector('[data-description]');
+        return [t && t.textContent, d && d.textContent].filter(Boolean).join(' | ').trim();
+      })
+      .catch(() => '');
+
+  // 逐字键入（真实键盘事件），比 fill 更能保证 React 受控组件的 state 被更新
+  const typeInto = async (loc, text) => {
+    if (typeof loc.pressSequentially === 'function') {
+      await loc.pressSequentially(text, { delay: 25 });
+    } else {
+      await loc.type(text, { delay: 25 }); // 兼容旧版 Playwright
+    }
+  };
+
+  try {
+    await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    // 这是 ~1MB 的 SPA，必须等水合完成；否则值只写进 DOM，React 的受控 state 读不到 → 提交空账号密码
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await cleanPopup(page);
+
+    if (!page.url().includes('/login')) {
+      console.log('✅ 已处于登录状态');
+      return;
+    }
+
+    const emailInput = page.locator('input[type="email"]').first();
+    await emailInput.waitFor({ state: 'visible', timeout: 20000 });
+    const passInput = page.locator('input[type="password"]').first();
+    const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
+
+    const fillCreds = async () => {
+      await emailInput.click();
+      await emailInput.fill('');
+      await typeInto(emailInput, email);
+      if ((await emailInput.inputValue()) !== email) await emailInput.fill(email);
+
+      await passInput.click();
+      await passInput.fill('');
+      await typeInto(passInput, password);
+      if ((await passInput.inputValue()) !== password) await passInput.fill(password);
+      await page.waitForTimeout(250);
+    };
+
+    await fillCreds();
+
+    let loggedIn = false;
+    let toastText = '';
+
+    for (let attempt = 1; attempt <= 2 && !loggedIn; attempt++) {
+      const btnText = (await signInBtn.innerText().catch(() => '')).trim();
+      console.log(`👆 [第 ${attempt} 次] 点击 Sign in（按钮文案: ${btnText || '未知'}）`);
+      await signInBtn.click();
+
+      for (let s = 0; s < (attempt === 1 ? 10 : 15); s++) {
+        await page.waitForTimeout(1000);
+
+        if (!toastText) {
+          const t = await readToast();
+          if (t) {
+            toastText = t;
+            console.log(`🍞 捕获到提示(toast): ${t}`);
+          }
+        }
+        if (!page.url().includes('/login')) {
+          loggedIn = true;
+          break;
+        }
+        await cleanPopup(page);
+        // 已经拿到错误提示就提前收尾，让后续截图还能拍到 toast
+        if (toastText) {
+          await page.waitForTimeout(800);
+          break;
+        }
+      }
+
+      // 既没跳转也没提示 → 很可能是水合未完成提交了空值，重填一次再试
+      if (!loggedIn && !toastText && attempt === 1) {
+        console.log('⚠️ 首次点击后既未跳转也无提示，判定可能水合未完成，重填后重试...');
+        await page.waitForTimeout(1500);
+        await fillCreds();
+      }
+    }
+
+    if (!loggedIn) {
+      dumpDiag('登录失败');
+      if (toastText) console.log(`❌ 服务器返回的登录错误: ${toastText}`);
+      throw new Error(
+        toastText
+          ? `登录被拒绝：${toastText}`
+          : '登录未成功跳转（未捕获到服务器提示，请查看上方诊断：鉴权响应 / 页面异常 / 控制台）'
+      );
+    }
+    console.log('🎉 登录成功！');
+  } finally {
+    page.off('console', onConsole);
+    page.off('pageerror', onPageError);
+    page.off('requestfailed', onRequestFailed);
+    page.off('response', onResponse);
   }
-  console.log('🎉 登录成功！');
 }
 
 // 执行开机指令（主三角键 + Standard start）
@@ -415,8 +520,8 @@ async function handleBillingRenew(page) {
 
 // 主任务入口
 async function runOnce() {
-  const email = (process.env.FREE_EMAIL || 'yuxiaojie0322@gmail.com').trim();
-  const password = process.env.FREE_PASSWORD || 'YxJ223512@';
+  const email = (process.env.FREE_EMAIL || '').trim();
+  const password = (process.env.FREE_PASSWORD || '').trim();
   const rawUrls = (process.env.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/c63915c5-59b1-446a-8b77-9b2ea7bff9f2').trim();
   const proxyUrl = (process.env.PROXY_URL || '').trim();
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
