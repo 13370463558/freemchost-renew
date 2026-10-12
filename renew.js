@@ -168,7 +168,7 @@ async function doLogin(page, email, password) {
 
     // 站点已知问题：首次登录会偶发 “Database error granting user”，重新登录一次即可
     const DB_ERROR_RE = /database error|granting user/i;
-    const MAX_ATTEMPTS = 4;
+    const MAX_ATTEMPTS = 6;
 
     while (attempt < MAX_ATTEMPTS && !loggedIn) {
       attempt += 1;
