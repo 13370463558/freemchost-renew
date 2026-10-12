@@ -156,19 +156,37 @@ async function doLogin(page, email, password) {
 
     let loggedIn = false;
     let toastText = '';
+    let attempt = 0;
 
-    for (let attempt = 1; attempt <= 2 && !loggedIn; attempt++) {
+    // 站点已知问题：首次登录会偶发 “Database error granting user”，重新登录一次即可
+    const DB_ERROR_RE = /database error|granting user/i;
+    const MAX_ATTEMPTS = 4;
+
+    while (attempt < MAX_ATTEMPTS && !loggedIn) {
+      attempt += 1;
+
+      // 第一次已在上面加载过；后续每次尝试都回到登录页重新来过
+      if (attempt > 1) {
+        console.log('🔄 重新加载登录页后重试...');
+        await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+        await page.waitForTimeout(1200);
+        await cleanPopup(page);
+      }
+
+      await fillCreds();
       const btnText = (await signInBtn.innerText().catch(() => '')).trim();
-      console.log(`👆 [第 ${attempt} 次] 点击 Sign in（按钮文案: ${btnText || '未知'}）`);
+      console.log(`👆 [第 ${attempt}/${MAX_ATTEMPTS} 次] 点击 Sign in（按钮文案: ${btnText || '未知'}）`);
       await signInBtn.click();
 
-      for (let s = 0; s < (attempt === 1 ? 10 : 15); s++) {
+      let attemptToast = '';
+      for (let s = 0; s < 12; s++) {
         await page.waitForTimeout(1000);
 
-        if (!toastText) {
+        if (!attemptToast) {
           const t = await readToast();
           if (t) {
-            toastText = t;
+            attemptToast = t;
             console.log(`🍞 捕获到提示(toast): ${t}`);
           }
         }
@@ -178,18 +196,25 @@ async function doLogin(page, email, password) {
         }
         await cleanPopup(page);
         // 已经拿到错误提示就提前收尾，让后续截图还能拍到 toast
-        if (toastText) {
+        if (attemptToast) {
           await page.waitForTimeout(800);
           break;
         }
       }
 
-      // 既没跳转也没提示 → 很可能是水合未完成提交了空值，重填一次再试
-      if (!loggedIn && !toastText && attempt === 1) {
-        console.log('⚠️ 首次点击后既未跳转也无提示，判定可能水合未完成，重填后重试...');
-        await page.waitForTimeout(1500);
-        await fillCreds();
+      if (loggedIn) break;
+
+      if (attemptToast && DB_ERROR_RE.test(attemptToast)) {
+        console.log(`⚠️ 首次授权异常（${attemptToast}）——站点已知问题，自动重新登录一次...`);
+        continue;
       }
+
+      toastText = attemptToast;
+      if (!toastText) {
+        console.log(`⚠️ 第 ${attempt} 次点击后既未跳转也无提示（可能是水合未完成），重填后再试...`);
+        continue;
+      }
+      break;
     }
 
     if (!loggedIn) {
